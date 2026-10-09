@@ -12,6 +12,9 @@ use libbpf_rs::{
     skel::{OpenSkel, SkelBuilder},
 };
 
+use super::attach_retry::{
+    AttachRetryQueue, RETRY_BUDGET, RETRY_WINDOW_MS, SLOW_RECHECK_SECS, ScanDecision, ScanOutcome,
+};
 use super::pidns::proc_root_is_init_pidns;
 use super::shared_maps::{MapKind, SharedMaps};
 use std::{
@@ -302,6 +305,9 @@ pub struct SslSniff {
     reattach_ttl: Duration,
     /// How many stale attachments have been re-attached (diagnostics/tests).
     stale_reattachs: u64,
+    /// Bounded re-scan schedule for processes whose attach came up empty — the
+    /// `execve`-before-`import ssl` race. See [`super::attach_retry`].
+    attach_retry: AttachRetryQueue,
     // Channel for user-space SslEvent (lightweight, no need for Box)
     tx: crossbeam_channel::Sender<SslEvent>,
     rx: crossbeam_channel::Receiver<SslEvent>,
@@ -357,6 +363,7 @@ impl SslSniff {
             pid_inodes: HashMap::default(),
             reattach_ttl: stale_reattach_ttl(),
             stale_reattachs: 0,
+            attach_retry: AttachRetryQueue::new(),
             tx,
             rx,
         })
@@ -371,11 +378,97 @@ impl SslSniff {
     /// unless that attachment is stale (older than the re-attach TTL), in
     /// which case the probes are re-attached and the old links are dropped
     /// only after the replacement succeeds.
+    ///
+    /// A scan that finds nothing to hook is not necessarily the end of the
+    /// story: the process may simply not have loaded its SSL library yet
+    /// (`python3.11` maps `libssl.so.3` only once the interpreter imports
+    /// `ssl`, which is *after* the `execve` that usually triggers this call).
+    /// Such pids go onto the bounded re-scan schedule in
+    /// [`super::attach_retry`], driven by [`Self::run_due_attach_retries`].
+    /// That schedule is also what stops a process which will *never* have a
+    /// hookable SSL library from being re-scanned on every trigger.
     pub fn attach_process(&mut self, pid: i32) -> Result<()> {
+        let now = Instant::now();
+        match self
+            .attach_retry
+            .admit(pid as u32, read_comm(pid as u32), now)
+        {
+            ScanDecision::Suppress => {
+                log::debug!(
+                    "[attach_process] pid={pid}: not scanning maps -- a re-scan is already \
+                     scheduled, or this pid's retry budget is spent"
+                );
+                return Ok(());
+            }
+            ScanDecision::Proceed => {}
+        }
+
+        let outcome = self.scan_and_attach(pid, true)?;
+        self.attach_retry
+            .report(pid as u32, outcome, Instant::now());
+        Ok(())
+    }
+
+    /// Re-scan the pids whose backoff has elapsed.
+    ///
+    /// Called from the main event loop (`AgentSight::maybe_run_attach_retries`)
+    /// rather than from the ring-buffer poll thread, which only holds `&self`
+    /// and so cannot mutate attach state. Returns the number of pids re-scanned.
+    pub fn run_due_attach_retries(&mut self) -> usize {
+        // Common case on a healthy host: nothing is queued. Bail before paying
+        // for the scan of `take_due`, since the driver polls every 200 ms.
+        if self.attach_retry.is_empty() {
+            return 0;
+        }
+        let due = self.attach_retry.take_due(Instant::now(), read_comm);
+        let mut rescanned = 0;
+        for retry in due {
+            let pid = retry.pid as i32;
+            rescanned += 1;
+            match self.scan_and_attach(pid, false) {
+                Ok(outcome) => {
+                    self.attach_retry.report(retry.pid, outcome, Instant::now());
+                    if retry.final_attempt && !outcome.is_terminal() {
+                        log::warn!(
+                            "[attach_process] pid={pid}: still nothing to hook after {} of {} \
+                             re-scans ({}ms window); giving up on the fast path. If this process \
+                             does make LLM calls, its traffic is NOT being captured. It will be \
+                             re-checked at most once per {}s while it lives. \
+                             (pids exhausted: {}, queued: {}, triggers suppressed: {}, evicted: {})",
+                            retry.attempt,
+                            RETRY_BUDGET,
+                            RETRY_WINDOW_MS,
+                            SLOW_RECHECK_SECS,
+                            self.attach_retry.exhausted_total(),
+                            self.attach_retry.len(),
+                            self.attach_retry.suppressed_total(),
+                            self.attach_retry.evicted_total(),
+                        );
+                    }
+                }
+                // maps unreadable: the process is gone. `take_due` already
+                // dropped the entry, so there is nothing to clean up.
+                Err(e) => log::debug!("[attach_process] pid={pid}: re-scan failed: {e:#}"),
+            }
+        }
+        rescanned
+    }
+
+    /// Read `maps` for `pid` and attach a uprobe per SSL candidate, reporting
+    /// what that produced so the caller can decide whether to re-scan.
+    ///
+    /// `loud` decides whether "found nothing" is a WARN (a first scan, worth a
+    /// human's attention) or a DEBUG (a scheduled re-scan, where repeating the
+    /// warning five times per pid would drown the log).
+    fn scan_and_attach(&mut self, pid: i32, loud: bool) -> Result<ScanOutcome> {
         let libs = ssl_libs_from_maps(pid)?;
         if libs.is_empty() {
-            log::warn!("[attach_process] pid={pid}: no SSL libraries found in maps");
-            return Ok(());
+            if loud {
+                log::warn!("[attach_process] pid={pid}: no SSL libraries found in maps");
+            } else {
+                log::debug!("[attach_process] pid={pid}: no SSL libraries found in maps (re-scan)");
+            }
+            return Ok(ScanOutcome::NoCandidates);
         }
 
         // Debug: print all libs found
@@ -389,6 +482,10 @@ impl SslSniff {
 
         let now = Instant::now();
         let mut attached_inodes: Vec<u64> = Vec::new();
+        // Coverage tallies, used only to pick the `ScanOutcome` below. A
+        // candidate that is neither attached nor failed was `Untraceable`, so
+        // `attached == 0 && failed == 0` is exactly the all-untraceable case.
+        let (mut attached, mut failed) = (0usize, 0usize);
         for (path, inode, kind) in libs {
             // Dedup by inode: with pid=-1 global attach each library only needs
             // to be attached once — the kernel's uprobe_mmap mechanism installs
@@ -410,6 +507,7 @@ impl SslSniff {
                     // Still record the pid→inode association so detach_process
                     // can track all pids referencing this inode.
                     attached_inodes.push(inode);
+                    attached += 1;
                     continue;
                 }
                 let age_secs = self
@@ -436,6 +534,9 @@ impl SslSniff {
                         attached_inodes.push(inode);
                     }
                 }
+                // Either way the previous links are still live, so this inode
+                // counts as covered.
+                attached += 1;
                 continue;
             }
 
@@ -443,6 +544,7 @@ impl SslSniff {
                 AttachOutcome::Attached(links) => {
                     self.record_attach(inode, links);
                     attached_inodes.push(inode);
+                    attached += 1;
                 }
                 AttachOutcome::Untraceable => {
                     // Not traceable on this host; leave the inode marked so we
@@ -451,6 +553,7 @@ impl SslSniff {
                 AttachOutcome::Failed => {
                     // Attach failed: drop the inode so a later retry can succeed.
                     self.traced_files.remove(&inode);
+                    failed += 1;
                 }
             }
         }
@@ -460,7 +563,16 @@ impl SslSniff {
             self.pid_inodes.insert(pid as u32, attached_inodes);
         }
 
-        Ok(())
+        Ok(if attached > 0 {
+            ScanOutcome::Attached
+        } else if failed == 0 {
+            // Every candidate was legitimately unhookable, and that answer is
+            // keyed by inode in `traced_files`: re-scanning cannot change it
+            // until the file on disk is replaced, which changes the inode.
+            ScanOutcome::UntraceableOnly
+        } else {
+            ScanOutcome::AllFailed
+        })
     }
 
     /// Number of SSL library inodes with live uprobe attachments (diagnostics).
@@ -599,6 +711,9 @@ impl SslSniff {
     /// prematurely would cause the scanner to re-attach on the next sweep,
     /// producing duplicate uprobe fds.
     pub fn detach_process(&mut self, pid: u32) {
+        // The process is gone: drop any pending re-scan so a recycled pid does
+        // not inherit its schedule, and so the queue never holds dead pids.
+        self.attach_retry.forget(pid);
         if let Some(inodes) = self.pid_inodes.remove(&pid) {
             let mut removed = 0;
             for inode in &inodes {
@@ -1105,6 +1220,20 @@ fn parse_maps_line(line: &str) -> Option<(u64, &str)> {
         }
     }
     Some((inode?, rest.trim_start()))
+}
+
+/// `<procfs root>/<pid>/comm`, trimmed, or `None` when unreadable.
+///
+/// Used by the re-scan schedule to notice pid recycling: a reused pid answers
+/// with a different name, and re-attaching it would put an unrelated process on
+/// the BPF `traced_processes` allowlist (`Probes::attach_process` registers the
+/// pid even when the SSL attach fails), which would start collecting its TLS
+/// plaintext. Read here rather than via `discovery::scanner::read_comm` to keep
+/// `probes/` from depending on `discovery/`.
+fn read_comm(pid: u32) -> Option<String> {
+    let raw = fs::read(proc_pid_entry(pid, "comm")).ok()?;
+    let comm = String::from_utf8_lossy(&raw).trim().to_string();
+    if comm.is_empty() { None } else { Some(comm) }
 }
 
 /// Parse `<procfs root>/<pid>/maps` and return `(attach_path, inode, SslLibKind)`

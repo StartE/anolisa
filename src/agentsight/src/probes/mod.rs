@@ -10,6 +10,7 @@ pub mod sslsniff;
 pub mod tcpsniff;
 pub mod udpdns;
 
+mod attach_retry;
 mod codex_offsets;
 mod elf_buildid;
 

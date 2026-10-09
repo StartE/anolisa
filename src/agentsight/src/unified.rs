@@ -106,6 +106,8 @@ pub struct AgentSight {
     last_interruption_purge: std::time::Instant,
     /// Rate-limiter for the buffer watermark log (at most once per 60 s)
     last_watermark_log: std::time::Instant,
+    /// Rate-limiter for the SSL attach re-scan schedule (at most once per 200 ms)
+    last_attach_retry: std::time::Instant,
     /// Cache of pid → agent_name, persists after process exit for deferred resolution
     pid_agent_name_cache: lru::LruCache<u32, String>,
     /// Live Agent processes sampled for Session resource timelines.
@@ -631,6 +633,7 @@ impl AgentSight {
             last_drain_check: std::time::Instant::now(),
             last_interruption_purge: std::time::Instant::now(),
             last_watermark_log: std::time::Instant::now(),
+            last_attach_retry: std::time::Instant::now(),
             pid_agent_name_cache,
             resource_targets,
             resource_sampler_handle,
@@ -1199,6 +1202,9 @@ impl AgentSight {
             // a saturated byte budget keeps the queue non-empty, which is exactly
             // when the watermarks matter most.
             self.maybe_log_buffer_watermarks();
+            // Outside the idle branch for the same reason as the watermarks: the
+            // attach race is lost precisely when the host is busy exec'ing.
+            self.maybe_run_attach_retries();
             if let Some(result) = self.try_process() {
                 log::trace!("[Event {result}] Processed");
             } else {
@@ -2283,6 +2289,32 @@ impl AgentSight {
             ) {
                 log::warn!("Interruption store purge failed: {e}");
             }
+        }
+    }
+
+    /// Drive the SSL attach re-scan schedule.
+    ///
+    /// `attach_process` reads `/proc/<pid>/maps` once, at whichever moment a
+    /// trigger fires. A dynamically linked interpreter that has not imported
+    /// `ssl` yet has no `libssl` in its maps at that point, and without a
+    /// re-scan it stays unhooked for life — in a sidecar deployment the
+    /// collector always starts first, so the `execve` trigger always wins the
+    /// race the wrong way. `probes::attach_retry` bounds the follow-up.
+    ///
+    /// Throttled to 200 ms, the finest step of that backoff: polling faster
+    /// cannot make a retry due sooner, and polling slower would add latency to
+    /// a window that is itself only a few hundred milliseconds wide.
+    fn maybe_run_attach_retries(&mut self) {
+        if self.last_attach_retry.elapsed() < std::time::Duration::from_millis(200) {
+            return;
+        }
+        self.last_attach_retry = std::time::Instant::now();
+
+        let rescanned = self.probes.run_due_ssl_attach_retries();
+        if rescanned > 0 {
+            log::debug!(
+                "[attach-retry] re-scanned {rescanned} pid(s) that had no SSL library attached yet"
+            );
         }
     }
 

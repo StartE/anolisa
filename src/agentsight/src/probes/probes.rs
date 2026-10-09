@@ -358,6 +358,15 @@ impl Probes {
         Ok(())
     }
 
+    /// Re-scan the processes whose SSL attach came up empty and whose backoff
+    /// has elapsed. Returns how many were re-scanned.
+    ///
+    /// Driven from the main event loop; see `probes::attach_retry` for why the
+    /// re-scan is needed at all and what bounds it.
+    pub fn run_due_ssl_attach_retries(&mut self) -> usize {
+        self.sslsniff.run_due_attach_retries()
+    }
+
     /// Start polling for events from the shared ring buffer
     ///
     /// A single background thread polls the shared ring buffer and dispatches
